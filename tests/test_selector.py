@@ -8,6 +8,8 @@ import weakref
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
+from cssselect.parser import SelectorSyntaxError
+from cssselect.xpath import ExpressionError
 from lxml import etree
 
 import parsel.selector as selector_module
@@ -440,6 +442,247 @@ class TestSelector:
         sel = self.sscls(text=body)
         assert sel.xpath('//div[@id="1"]').css("span::text").extract() == ["me"]
         assert sel.css("#1").xpath("./span/text()").extract() == ["me"]
+
+    fragment_page = """<html><body>
+        <p class="sku">page-level</p>
+        <section class="card" data-id="7">
+            <h2>Alpha</h2>
+            <p class="sku">A-1</p>
+            <p class="sku lead">A-1</p>
+            <span class="tag">first-only</span>
+            <code>A</code>
+        </section>
+        <section class="card" data-id="8">
+            <h2>Beta</h2>
+            <p class="sku">B-2</p>
+            <p class="note">shared</p>
+            <em>present</em>
+            <code>(</code>
+        </section>
+        <section class="card" data-id="9">
+            <h2>Gamma</h2>
+            <p class="note">shared</p>
+            <code>shared</code>
+        </section>
+    </body></html>"""
+
+    namespaced_fragment_page = """<?xml version="1.0" encoding="UTF-8"?>
+    <catalog xmlns="urn:shop" xmlns:dc="http://purl.org/dc/elements/1.1/">
+        <item sku="A-1"><dc:title>Alpha</dc:title><link href="/a"/></item>
+        <item sku="B-2"><dc:title>Beta</dc:title><link href="/b"/><link href="/b"/></item>
+        <item sku="C-3"><dc:title>Gamma</dc:title></item>
+    </catalog>"""
+
+    def fragment_selectors(self) -> SelectorList[Selector]:
+        """Return the three sibling ``section.card`` fragments of a page."""
+        return self.sscls(text=self.fragment_page).css("section.card")
+
+    def named_xml_fragment_selectors(self) -> SelectorList[Selector]:
+        """Return the three ``shop:item`` fragments of a namespaced XML page."""
+        page = self.sscls(text=self.namespaced_fragment_page, type="xml")
+        page.register_namespace("shop", "urn:shop")
+        page.register_namespace("dc", "http://purl.org/dc/elements/1.1/")
+        return page.xpath("//shop:item")
+
+    def test_chained_css_children_stay_within_their_fragment(self) -> None:
+        fragments = self.fragment_selectors()
+        per_fragment = [f.css("p.sku::text").getall() for f in fragments]
+        # The third fragment has no p.sku, and the page-level p.sku is never
+        # reached from any fragment.
+        assert per_fragment == [["A-1", "A-1"], ["B-2"], []]
+        assert fragments.css("p.sku::text").getall() == ["A-1", "A-1", "B-2"]
+        assert "page-level" not in fragments.css("p.sku::text").getall()
+        assert fragments.css("p.missing::text").getall() == []
+
+    def test_chained_xpath_children_stay_within_their_fragment(self) -> None:
+        fragments = self.fragment_selectors()
+        per_fragment = [
+            f.xpath(".//p[@class='sku']/text()").getall() for f in fragments
+        ]
+        # The second paragraph of the first fragment has class "sku lead", so
+        # an exact class match skips it.
+        assert per_fragment == [["A-1"], ["B-2"], []]
+        assert fragments.xpath(".//p[@class='sku']/text()").getall() == ["A-1", "B-2"]
+        # The same relative path yields different nodes per fragment.
+        assert [f.xpath("./p[1]/text()").getall() for f in fragments] == [
+            ["A-1"],
+            ["B-2"],
+            ["shared"],
+        ]
+        assert [f.xpath(".//p[2]/text()").getall() for f in fragments] == [
+            ["A-1"],
+            ["shared"],
+            [],
+        ]
+        assert fragments.xpath(".//p[2]/text()").getall() == ["A-1", "shared"]
+
+    def test_chained_results_keep_their_parent_ownership(self) -> None:
+        fragments = self.fragment_selectors()
+        children = fragments.css("p.sku")
+        assert len(children) == 3
+        assert [child.root.getparent() for child in children] == [
+            fragments[0].root,
+            fragments[0].root,
+            fragments[1].root,
+        ]
+        assert children[0].root.getparent() is fragments[0].root
+        assert children[2].root.getparent() is fragments[1].root
+        assert all(
+            child.root.getparent() is not fragments[2].root for child in children
+        )
+        assert fragments[2].css("p.sku").getall() == []
+
+    def test_chained_results_keep_order_and_duplicates(self) -> None:
+        fragments = self.fragment_selectors()
+        merged = fragments.css("p::text").getall()
+        # Duplicates are kept, and each fragment contributes in page order.
+        assert merged == ["A-1", "A-1", "B-2", "shared", "shared"]
+        assert merged == [text for f in fragments for text in f.css("p::text").getall()]
+        assert fragments.xpath(".//p/text()").getall() == merged
+        assert fragments.xpath(".//p[@class='note']/text()").getall() == [
+            "shared",
+            "shared",
+        ]
+
+    def test_absolute_xpath_on_fragments_is_page_wide_and_warns_once(self) -> None:
+        fragments = self.fragment_selectors()
+        with pytest.warns(AbsoluteXPathWarning) as record:
+            result = fragments.xpath("//h2/text()")
+        # An absolute expression keeps the document as its context, so every
+        # fragment sees all three headings, including those of its siblings.
+        assert result.getall() == ["Alpha", "Beta", "Gamma"] * 3
+        assert len(record) == 1
+        assert str(record[0].message) == (
+            "Absolute XPath '//h2/text()' used on a nested selector"
+        )
+        assert record[0].filename == __file__
+        # The warning does not turn subsequent relative queries into
+        # document-wide ones.
+        assert fragments.xpath(".//p[@class='sku']/text()").getall() == ["A-1", "B-2"]
+        assert fragments.css("h2::text").getall() == ["Alpha", "Beta", "Gamma"]
+        with pytest.warns(
+            AbsoluteXPathWarning, match="Absolute XPath.*nested selector"
+        ):
+            single = fragments[1].xpath("//h2/text()")
+        assert single.getall() == ["Alpha", "Beta", "Gamma"]
+
+    def test_named_xml_fragments_scope_css_and_xpath_children(self) -> None:
+        fragments = self.named_xml_fragment_selectors()
+        assert [f.xpath("./@sku").getall() for f in fragments] == [
+            ["A-1"],
+            ["B-2"],
+            ["C-3"],
+        ]
+        assert fragments.xpath("./@sku").getall() == ["A-1", "B-2", "C-3"]
+        assert [f.xpath("./dc:title/text()").getall() for f in fragments] == [
+            ["Alpha"],
+            ["Beta"],
+            ["Gamma"],
+        ]
+        assert [f.css("dc|title::text").getall() for f in fragments] == [
+            ["Alpha"],
+            ["Beta"],
+            ["Gamma"],
+        ]
+        assert fragments.css("dc|title::text").getall() == ["Alpha", "Beta", "Gamma"]
+        # A CSS type selector does not match namespaced elements without
+        # a prefix, so it must not pull siblings in from another fragment.
+        assert fragments.css("title::text").getall() == []
+        assert [f.css("shop|link::attr(href)").getall() for f in fragments] == [
+            ["/a"],
+            ["/b", "/b"],
+            [],
+        ]
+        assert fragments.css("shop|link::attr(href)").getall() == ["/a", "/b", "/b"]
+
+    def test_named_xml_fragment_queries_keep_their_namespace_state(self) -> None:
+        fragments = self.named_xml_fragment_selectors()
+        assert fragments[0].namespaces["shop"] == "urn:shop"
+        assert fragments[0].namespaces["dc"] == "http://purl.org/dc/elements/1.1/"
+        # Per-call namespaces are not saved on the fragments.
+        assert fragments.xpath(
+            "./alt:title/text()",
+            namespaces={"alt": "http://purl.org/dc/elements/1.1/"},
+        ).getall() == ["Alpha", "Beta", "Gamma"]
+        assert all("alt" not in f.namespaces for f in fragments)
+        # A failed lookup leaves the registered prefixes usable.
+        with pytest.raises(ValueError, match="Undefined namespace prefix"):
+            fragments.xpath("./missing:title/text()")
+        assert fragments.xpath("./shop:link/@href").getall() == ["/a", "/b", "/b"]
+        assert fragments.css("dc|title::text").getall() == ["Alpha", "Beta", "Gamma"]
+
+    def test_chained_text_and_attribute_results_stay_within_their_fragment(
+        self,
+    ) -> None:
+        fragments = self.fragment_selectors()
+        text_nodes = fragments.xpath(".//p[@class='note']/text()")
+        assert text_nodes.getall() == ["shared", "shared"]
+        assert [node.xpath(".").getall() for node in text_nodes] == [
+            ["shared"],
+            ["shared"],
+        ]
+        assert text_nodes.xpath(".//span").getall() == []
+
+        attributes = fragments.xpath(".//p[@class='sku']/@class")
+        assert attributes.getall() == ["sku", "sku"]
+        assert [attribute.xpath(".").getall() for attribute in attributes] == [
+            ["sku"],
+            ["sku"],
+        ]
+        assert fragments.css("p.sku::attr(class)").getall() == [
+            "sku",
+            "sku lead",
+            "sku",
+        ]
+        assert fragments.css("p.sku::text").xpath(".").getall() == [
+            "A-1",
+            "A-1",
+            "B-2",
+        ]
+        # Attribute results only cover nodes below their own fragment.
+        assert fragments.css("::attr(data-id)").getall() == ["7", "8", "9"]
+        assert fragments.xpath("./@data-id").getall() == ["7", "8", "9"]
+
+    def test_runtime_expression_failure_does_not_affect_other_fragments(self) -> None:
+        fragments = self.fragment_selectors()
+        # The second fragment's code node is "(", which makes re:test fail only
+        # while the evaluator runs against that fragment's data.
+        with pytest.raises(re.error, match="unterminated subpattern"):
+            fragments.xpath("re:test(.//em, ./code)")
+        # Fragments without the failing data still evaluate normally.
+        assert fragments[0].xpath("re:test(.//em, ./code)").get() == "0"
+        assert fragments[2].xpath("re:test(.//em, ./code)").get() == "0"
+        assert fragments.xpath("re:test(.//p, 'A')").getall() == ["1", "0", "0"]
+        # The failure is not cached and the list keeps answering other queries.
+        with pytest.raises(re.error, match="unterminated subpattern"):
+            fragments.xpath("re:test(.//em, ./code)")
+        assert fragments.css("p.note::text").getall() == ["shared", "shared"]
+        assert fragments.xpath(".//p[@class='sku']/text()").getall() == ["A-1", "B-2"]
+
+    def test_empty_results_and_expression_errors_leave_fragments_usable(self) -> None:
+        fragments = self.fragment_selectors()
+        # Empty results on every fragment, followed by a valid query.
+        assert fragments.xpath(".//i").getall() == []
+        assert fragments.css("p.missing::text").getall() == []
+        assert fragments.xpath(".//i").xpath(".//text()").getall() == []
+        assert fragments.xpath(".//em/text()").getall() == ["present"]
+        assert fragments.css("em::text").getall() == ["present"]
+        # Invalid XPath: parse error, undefined prefix, undefined variable.
+        for query in (".//p[", "./missing:em/text()", "$missing"):
+            with pytest.raises(ValueError, match="XPath error"):
+                fragments.xpath(query)
+            assert fragments.xpath(".//p[@class='note']/text()").getall() == [
+                "shared",
+                "shared",
+            ]
+        # Invalid CSS: syntax error and unknown pseudo-element, interleaved
+        # with valid queries on the same fragments.
+        with pytest.raises(SelectorSyntaxError, match="Expected ident"):
+            fragments.css("p[")
+        with pytest.raises(ExpressionError, match="pseudo-element"):
+            fragments.css("p::unknown")
+        assert fragments.css("p.sku::text").getall() == ["A-1", "A-1", "B-2"]
+        assert fragments.xpath(".//h2/text()").getall() == ["Alpha", "Beta", "Gamma"]
 
     def test_dont_strip(self) -> None:
         sel = self.sscls(text='<div>fff: <a href="#">zzz</a></div>')
