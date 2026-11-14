@@ -3,6 +3,16 @@
 History
 -------
 
+(unreleased)
+~~~~~~~~~~~~
+
+* Added ``Selector.verify()`` and ``SelectorList.verify()``, which run a CSS
+  query and an XPath query on the same selector and raise
+  ``VerificationError`` unless both select the same values, in the same order,
+  including repeated and empty values. The error message names the position of
+  the difference and describes the differing results, with the location of the
+  elements. An invalid query on either side fails the whole check.
+
 1.12.1 (2026-09-28)
 ~~~~~~~~~~~~~~~~~~~
 

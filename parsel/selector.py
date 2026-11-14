@@ -22,6 +22,7 @@ from typing import (
 )
 
 import jmespath
+from cssselect.parser import SelectorError
 from lxml import etree, html
 
 from .csstranslator import GenericTranslator, HTMLTranslator
@@ -55,6 +56,99 @@ class CannotDropElementWithoutParent(CannotRemoveElementWithoutParent):
 
 class AbsoluteXPathWarning(UserWarning):
     """Emitted when an absolute XPath is used on a nested selector."""
+
+
+class VerificationError(ValueError):
+    """Raised when a CSS query and an XPath query that are meant to describe
+    the same data do not return the same values, or when one of them cannot be
+    evaluated.
+
+    .. versionadded:: VERSION
+    """
+
+
+def _node_path(selector: Selector) -> str:
+    """Return the absolute XPath of the element that a selector points to,
+    or an empty string if there is no such element.
+
+    Text and attribute values are ``str`` objects, so they point to no element
+    unless smart strings are enabled for the selector class.
+    """
+    root = selector.root
+    element = root if isinstance(root, etree._Element) else None
+    if element is None:
+        try:
+            element = root.getparent()
+        except AttributeError:
+            return ""
+    try:
+        return element.getroottree().getpath(element)
+    except AttributeError:
+        return ""
+
+
+def _describe_result(selector: Selector) -> str:
+    """Describe one query result for an error message.
+
+    The description contains the value that would be collected from the
+    result, which is what the comparison is made on, and, when the result can
+    be located in the document, the absolute XPath of the element that it
+    comes from or belongs to, so that the difference can be found.
+    """
+    value = shorten(str(selector.get()), width=60)
+    path = _node_path(selector)
+    if path:
+        return f"{value!r} (the element at {path})"
+    return repr(value)
+
+
+def _count(count: int) -> str:
+    return f"{count} result" if count == 1 else f"{count} results"
+
+
+def _verify_results(
+    css: str,
+    xpath: str,
+    css_results: SelectorList[Any],
+    xpath_results: SelectorList[Any],
+    where: str = "",
+) -> None:
+    """Raise :class:`VerificationError` if the two result lists differ.
+
+    Results are compared one by one, in document order, by the value that
+    :meth:`Selector.get` would collect from them, so repeated values and
+    empty values take part in the comparison.
+    """
+    common = min(len(css_results), len(xpath_results))
+    for index in range(common):
+        css_value = css_results[index].get()
+        if css_value != xpath_results[index].get():
+            raise VerificationError(
+                f"CSS query {css!r} and XPath query {xpath!r} select different"
+                f" values at result #{index + 1}{where}: the CSS query selects"
+                f" {_describe_result(css_results[index])}, and the XPath query"
+                f" selects {_describe_result(xpath_results[index])}"
+            )
+    css_count = len(css_results)
+    xpath_count = len(xpath_results)
+    if css_count == xpath_count:
+        return
+    if css_count > xpath_count:
+        extra, side = css_results[xpath_count], "CSS"
+    else:
+        extra, side = xpath_results[css_count], "XPath"
+    if common == 0:
+        matched = "no result is selected by both queries"
+    elif common == 1:
+        matched = "the first value matches"
+    else:
+        matched = f"the first {common} values match"
+    raise VerificationError(
+        f"CSS query {css!r} selects {_count(css_count)} and XPath query"
+        f" {xpath!r} selects {_count(xpath_count)}{where}: {matched}, and"
+        f" result #{common + 1} is selected only by the {side} query"
+        f" ({_describe_result(extra)})"
+    )
 
 
 class SafeXMLParser(etree.XMLParser):
@@ -251,6 +345,35 @@ class SelectorList(list[_SelectorType]):
         ``query`` is the same argument as the one in :meth:`Selector.css`
         """
         return self.__class__(flatten([x.css(query) for x in self]))
+
+    def verify(
+        self,
+        css: str,
+        xpath: str,
+        namespaces: Mapping[str, str] | None = None,
+        **kwargs: Any,
+    ) -> SelectorList[_SelectorType]:
+        """
+        Run the ``.verify()`` method for each element in this list and return
+        the results of the CSS queries flattened as another
+        :class:`SelectorList`.
+
+        Each element is checked on its own, so the queries keep the scope that
+        they have on that element, and the results of all elements are
+        flattened in the same order as :meth:`css` and :meth:`xpath` would
+        return them. A difference found on any element fails the whole check.
+
+        ``css``, ``xpath``, ``namespaces`` and the additional named arguments
+        are the same as in :meth:`Selector.verify`.
+        """
+        if xpath[:1] == "/":
+            for sel in self:
+                if sel._warn_if_nested(xpath, stacklevel=3):
+                    break
+        results: list[SelectorList[_SelectorType]] = []
+        for index, sel in enumerate(self):
+            results.append(sel._verify(css, xpath, namespaces, kwargs, index=index))
+        return self.__class__(flatten(results))
 
     def re(self, regex: str | Pattern[str], replace_entities: bool = True) -> list[str]:
         """
@@ -827,6 +950,75 @@ class Selector:
     def _css2xpath(self, query: str) -> str:
         type_ = _xml_or_html(self.type)
         return _ctgroup[type_]["_csstranslator"].css_to_xpath(query)
+
+    def verify(
+        self,
+        css: str,
+        xpath: str,
+        namespaces: Mapping[str, str] | None = None,
+        **kwargs: Any,
+    ) -> SelectorList[Self]:
+        """
+        Check that the CSS query ``css`` and the XPath query ``xpath`` describe
+        the same data, and return the results of the CSS query.
+
+        Both queries are run on the same selector, each with its own scope, as
+        :meth:`css` and :meth:`xpath` would run it, and their results are
+        compared in document order, by the values that :meth:`get` collects
+        from them. Repeated values and empty values are kept, so the two
+        result lists must match one to one.
+
+        Absolute XPath queries keep the behavior that they have in
+        :meth:`xpath`, including the warning for a nested selector.
+
+        ``namespaces`` is an optional ``prefix: namespace-uri`` mapping (dict)
+        for additional prefixes, used by both queries. Any additional named
+        arguments are passed to the XPath query as variables.
+
+        Raises :class:`VerificationError` if the results differ, or if either
+        query is invalid or cannot be evaluated; in the latter case the other
+        query is not used as a fallback.
+        """
+        if xpath[:1] == "/":
+            self._warn_if_nested(xpath, stacklevel=3)
+        return self._verify(css, xpath, namespaces, kwargs)
+
+    def _verify(
+        self,
+        css: str,
+        xpath: str,
+        namespaces: Mapping[str, str] | None,
+        kwargs: dict[str, Any],
+        index: int | None = None,
+    ) -> SelectorList[Self]:
+        if self.type not in ("html", "xml", "text"):
+            raise ValueError(f"Cannot use verify on a Selector of type {self.type!r}")
+        where = ""
+        if index is not None:
+            path = _node_path(self)
+            where = (
+                f" on selector #{index + 1} of the list ({path})"
+                if path
+                else f" on selector #{index + 1} of the list"
+            )
+        try:
+            css_query = self._css2xpath(css)
+        except SelectorError as exc:
+            raise VerificationError(f"Invalid CSS query {css!r}{where}: {exc}") from exc
+        try:
+            css_results = self._xpath(css_query, namespaces, kwargs)
+        except ValueError as exc:
+            raise VerificationError(
+                f"CSS query {css!r} cannot be evaluated{where}: {exc}"
+            ) from exc
+        try:
+            xpath_results = self._xpath(xpath, namespaces, kwargs)
+        except ValueError as exc:
+            raise VerificationError(
+                f"XPath query {xpath!r} cannot be evaluated{where}: {exc}"
+            ) from exc
+        _verify_results(css, xpath, css_results, xpath_results, where)
+        return css_results
 
     def re(self, regex: str | Pattern[str], replace_entities: bool = True) -> list[str]:
         """

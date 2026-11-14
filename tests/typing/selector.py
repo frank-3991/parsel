@@ -16,6 +16,10 @@ def correct() -> None:
     xpath_values: list[str] = selector.xpath(
         "//somens:a/text()", namespaces={"somens": "http://scrapy.org"}
     ).extract()
+    verified_values: list[str] = selector.verify(
+        "li::text", "//li/text()", namespaces={"somens": "http://scrapy.org"}
+    ).getall()
+    verified_first_value: str | None = selector.verify("li::text", "//li/text()").get()
 
     class MySelector(Selector):
         def my_own_func(self) -> int:
@@ -38,6 +42,10 @@ def incorrect() -> None:
 
     # Wrong query type in css.
     selector.css(5).getall()  # type: ignore[arg-type]
+
+    # Wrong query type in verify.
+    selector.verify(5, "//li/text()")  # type: ignore[arg-type]
+    selector.verify("li::text", 5)  # type: ignore[arg-type]
 
     # Cannot assign a list of str to an int.
     li_values: int = selector.css("li").getall()  # type: ignore[assignment]

@@ -8,6 +8,7 @@ import weakref
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
+from cssselect.parser import SelectorError
 from lxml import etree
 
 import parsel.selector as selector_module
@@ -16,6 +17,7 @@ from parsel.selector import (
     _NOT_SET,
     CannotRemoveElementWithoutParent,
     CannotRemoveElementWithoutRoot,
+    VerificationError,
 )
 
 if TYPE_CHECKING:
@@ -726,6 +728,273 @@ class TestSelector:
             match=r"Absolute XPath '//p' used on a nested selector",
         ):
             assert nested.xpath("//p").get() == "<p>a</p>"
+
+    def test_verify_same_values(self) -> None:
+        body = """<html><body>
+            <ul>
+              <li class="item">one</li>
+              <li class="item">two</li>
+              <li class="item">two</li>
+              <li class="item"> </li>
+            </ul>
+        </body></html>"""
+        sel = self.sscls(text=body)
+
+        # Repeated values and empty values are kept, in document order.
+        assert sel.verify(".item::text", "//li[@class='item']/text()").getall() == [
+            "one",
+            "two",
+            "two",
+            " ",
+        ]
+        assert sel.verify("li", "//li").getall() == [
+            '<li class="item">one</li>',
+            '<li class="item">two</li>',
+            '<li class="item">two</li>',
+            '<li class="item"> </li>',
+        ]
+        assert (
+            sel.verify(".item", "//li[@class='item']").getall()
+            == sel.css(".item").getall()
+        )
+
+        # The result is the result of the CSS query, with its expressions.
+        result = sel.verify(".item::text", "//li[@class='item']/text()")
+        assert [selector._expr for selector in result] == [
+            selector._expr for selector in sel.css(".item::text")
+        ]
+
+    def test_verify_empty_values(self) -> None:
+        body = """<html><body>
+            <p></p><p>text</p>
+            <a href=""></a><a href="a.html">A</a>
+        </body></html>"""
+        sel = self.sscls(text=body)
+        # Empty attribute values are part of the comparison.
+        assert sel.verify("a::attr(href)", "//a/@href").getall() == ["", "a.html"]
+        with pytest.raises(VerificationError, match="result #1"):
+            sel.verify("a::attr(href)", '//a[@href!=""]/@href')
+        # An element with no text node has no text to collect, in both queries.
+        assert sel.verify("p::text", "//p/text()").getall() == ["text"]
+        with pytest.raises(VerificationError, match="result #1"):
+            sel.verify("p", "//p/text()")
+
+    def test_verify_attributes(self) -> None:
+        body = '<html><body><a href="a.html" title="t">A</a></body></html>'
+        sel = self.sscls(text=body)
+        assert sel.verify("a::attr(href)", "//a/@href").get() == "a.html"
+        assert sel.verify("a::attr(title)", "//a/@title").get() == "t"
+
+    def test_verify_node_attributes_text(self) -> None:
+        body = '<html><body><p title="t">text</p></body></html>'
+        sel = self.sscls(text=body)
+        assert sel.verify("p", "//p").get() == '<p title="t">text</p>'
+        assert sel.verify("p::text", "//p/text()").get() == "text"
+        assert sel.verify("p::attr(title)", "//p/@title").get() == "t"
+
+        # The results are compared by the collected value, so an element result
+        # and a text result differ even for the same element.
+        with pytest.raises(VerificationError, match="result #1"):
+            sel.verify("p", "//p/text()")
+        with pytest.raises(VerificationError, match="result #1"):
+            sel.verify("p::attr(title)", "//p/text()")
+
+    def test_verify_difference_points_at_results(self) -> None:
+        body = """<html><body>
+            <div id="one"><a href="a.html">A</a><a href="b.html">B</a></div>
+            <div id="two"><a href="c.html">C</a></div>
+        </body></html>"""
+        sel = self.sscls(text=body)
+        with pytest.raises(VerificationError) as caught:
+            sel.verify("#one a", "//div[@id='two']//a")
+        message = str(caught.value)
+        assert "result #1" in message
+        assert "'<a href=\"a.html\">A</a>'" in message
+        assert "/html/body/div[1]/a" in message
+        assert "'<a href=\"c.html\">C</a>'" in message
+        assert "/html/body/div[2]/a" in message
+
+    def test_verify_different_lengths(self) -> None:
+        body = """<html><body>
+            <a href="a.html">A</a><a href="b.html">B</a><a href="c.html">C</a>
+        </body></html>"""
+        sel = self.sscls(text=body)
+        with pytest.raises(VerificationError, match="selects 3 results"):
+            sel.verify("a", "//a[position() < 3]")
+        with pytest.raises(VerificationError, match="selects 2 results"):
+            sel.verify("a:nth-child(-n+2)", "//a")
+        with pytest.raises(VerificationError, match=r"result #3 is selected only by"):
+            sel.verify("a::attr(href)", '//a[@href!="c.html"]/@href')
+        with pytest.raises(VerificationError, match=r"result #3 is selected only by"):
+            sel.verify('a[href!="c.html"]::attr(href)', "//a/@href")
+
+    def test_verify_empty_results(self) -> None:
+        sel = self.sscls(text="<html><body><p>text</p></body></html>")
+        assert sel.verify("span", "//span").getall() == []
+        assert sel.verify("span::text", "//span/text()").getall() == []
+        assert sel.verify("missing::attr(href)", "//missing/@href").getall() == []
+
+    def test_verify_invalid_css(self) -> None:
+        sel = self.sscls(text="<html><body><p>text</p></body></html>")
+        for query in ("p[", "p::unknown", ""):
+            with pytest.raises(VerificationError, match="Invalid CSS query"):
+                sel.verify(query, "//p")
+
+    def test_verify_invalid_xpath(self) -> None:
+        sel = self.sscls(text="<html><body><p>text</p></body></html>")
+        for query in ("//p[", "unknown-func(//p)", "//p[$missing]"):
+            with pytest.raises(VerificationError, match="cannot be evaluated"):
+                sel.verify("p", query)
+        # The valid side is not used as a fallback.
+        with pytest.raises(VerificationError, match="XPath query"):
+            sel.verify("span", "//p[")
+        with pytest.raises(VerificationError, match="XPath query"):
+            sel.verify("p", "//undefined:a/text()")
+
+    def test_verify_does_not_change_single_queries(self) -> None:
+        body = "<html><body><p>text</p><p></p></body></html>"
+        sel = self.sscls(text=body)
+        assert sel.css("p").getall() == ["<p>text</p>", "<p></p>"]
+        assert sel.xpath("//p").getall() == ["<p>text</p>", "<p></p>"]
+        with pytest.raises(ValueError, match="XPath error"):
+            sel.xpath("//p[")
+        with pytest.raises(SelectorError):
+            sel.css("p[")
+        assert sel.css("p").getall() == ["<p>text</p>", "<p></p>"]
+
+    def test_verify_nested_scope(self) -> None:
+        body = """<body>
+            <div class="one"><ul><li>one</li><li>two</li></ul></div>
+            <div class="two"><ul><li>four</li><li>five</li></ul></div>
+        </body>"""
+        sel = self.sscls(text=body)
+        divtwo = sel.xpath('//div[@class="two"]')[0]
+
+        # Relative queries on a nested selector keep its scope in both.
+        assert divtwo.verify("li::text", ".//li/text()").getall() == ["four", "five"]
+        assert divtwo.verify("li::text", "./ul/li/text()").getall() == ["four", "five"]
+
+        # An absolute XPath keeps the whole-document scope, so it no longer
+        # matches the nested CSS query, and the warning is still emitted.
+        with (
+            pytest.warns(AbsoluteXPathWarning, match="Absolute XPath.*nested"),
+            pytest.raises(VerificationError, match="result #1"),
+        ):
+            divtwo.verify("li::text", "//li/text()")
+
+        # On the root selector the same absolute query is in scope.
+        assert sel.verify("li::text", "//li/text()").getall() == [
+            "one",
+            "two",
+            "four",
+            "five",
+        ]
+
+    def test_verify_nested_difference_in_scope(self) -> None:
+        body = """<body>
+            <div class="one"><ul><li>one</li><li>two</li></ul></div>
+            <div class="two"><ul><li>four</li><li>five</li></ul></div>
+        </body>"""
+        divtwo = self.sscls(text=body).xpath('//div[@class="two"]')[0]
+        with pytest.raises(VerificationError) as caught:
+            divtwo.verify("li::text", ".//li[1]/text()")
+        message = str(caught.value)
+        assert "result #2 is selected only by the CSS" in message
+        assert "'five'" in message
+
+        # Element results also name the element, so the difference can be found
+        # in the document.
+        with pytest.raises(VerificationError) as caught:
+            divtwo.verify("li", ".//li[1]")
+        message = str(caught.value)
+        assert "result #2 is selected only by the CSS" in message
+        assert "/html/body/div[2]/ul/li[2]" in message
+
+    def test_verify_selectorlist_checks_each_item(self) -> None:
+        body = """<body>
+            <div id="one"><p>a</p></div>
+            <div id="two"><p>b</p><p>c</p></div>
+        </body>"""
+        sel = self.sscls(text=body)
+        divs = sel.css("div")
+        assert divs.verify("p::text", ".//p/text()").getall() == ["a", "b", "c"]
+        assert divs.verify("p", ".//p").getall() == sel.css("p").getall()
+
+    def test_verify_selectorlist_absolute_xpath_warns(self) -> None:
+        body = "<div><p>a</p></div>"
+        divs = self.sscls(text=body).css("div")
+        with pytest.warns(
+            AbsoluteXPathWarning, match="Absolute XPath.*nested selector"
+        ):
+            assert divs.verify("p", "//p").getall() == ["<p>a</p>"]
+
+    def test_verify_selectorlist_reports_offending_item(self) -> None:
+        body = """<body>
+            <div id="one"><a href="a.html">A</a></div>
+            <div id="two"><a href="a.html">A</a><a href="b.html">B</a></div>
+        </body>"""
+        divs = self.sscls(text=body).css("div")
+        assert divs.verify("a::attr(href)", ".//a/@href").getall() == [
+            "a.html",
+            "a.html",
+            "b.html",
+        ]
+        # The first item matches, the second one does not.
+        with pytest.raises(VerificationError) as caught:
+            divs.verify("a::attr(href)", ".//a[1]/@href")
+        message = str(caught.value)
+        assert "on selector #2 of the list (/html/body/div[2])" in message
+        assert "selects 2 results" in message
+
+    def test_verify_namespaces(self) -> None:
+        body = """<?xml version="1.0" encoding="UTF-8"?>
+<test xmlns:somens="http://scrapy.org">
+   <somens:a id="foo">take this</somens:a>
+   <somens:a id="bar">found</somens:a>
+</test>
+        """
+        sel = self.sscls(text=body, type="xml")
+        sel.register_namespace("somens", "http://scrapy.org")
+        assert sel.verify("somens|a::text", "//somens:a/text()").getall() == [
+            "take this",
+            "found",
+        ]
+        assert sel.verify("somens|a::attr(id)", "//somens:a/@id").getall() == [
+            "foo",
+            "bar",
+        ]
+
+        # Ad-hoc namespaces are passed to both queries.
+        other = self.sscls(text=body, type="xml")
+        with pytest.raises(VerificationError, match="cannot be evaluated"):
+            other.verify("somens|a::text", "//somens:a/text()")
+        assert other.verify(
+            "somens|a::text",
+            "//somens:a/text()",
+            namespaces={"somens": "http://scrapy.org"},
+        ).getall() == ["take this", "found"]
+
+    def test_verify_xpath_variables(self) -> None:
+        body = '<html><body><a href="b.html">B</a></body></html>'
+        sel = self.sscls(text=body)
+        assert sel.verify(
+            "a::attr(href)", "//a[@href=$link]/@href", link="b.html"
+        ).getall() == ["b.html"]
+
+    def test_verify_absolute_xpath_warning_points_at_user_code(self) -> None:
+        nested = self.sscls(text="<div><p>a</p></div>").xpath("//div")[0]
+        with pytest.warns(AbsoluteXPathWarning) as record:
+            nested.verify("p", "//p")
+        assert record[0].filename == __file__
+
+        nested_list = self.sscls(text="<div><p>a</p></div>").css("div")
+        with pytest.warns(AbsoluteXPathWarning) as record:
+            nested_list.verify("p", "//p")
+        assert record[0].filename == __file__
+
+    def test_verify_unsupported_type(self) -> None:
+        with pytest.raises(ValueError, match="Cannot use verify on a Selector"):
+            self.sscls(text='{"a": 1}').verify("a", "//a")
 
     def test_http_header_encoding_precedence(self) -> None:
         # '\xa3'     = pound symbol in unicode

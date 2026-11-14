@@ -322,6 +322,57 @@ too. Here's an example::
     Link number 3 points to url 'image4.html' and image 'image4_thumb.jpg'
     Link number 4 points to url 'image5.html' and image 'image5_thumb.jpg'
 
+.. _verifying-queries:
+
+Verifying CSS and XPath queries
+-------------------------------
+
+When the same data can be described with both CSS and XPath, ``.verify()``
+runs the two queries and checks that they select the same values, so that a
+mistake in one of them does not go unnoticed while a scraping task runs::
+
+    >>> from parsel import Selector
+    >>> sel = Selector(text="""<html><body>
+    ...     <ul>
+    ...         <li class="item">one</li>
+    ...         <li class="item">two</li>
+    ...         <li class="item">two</li>
+    ...     </ul>
+    ... </body></html>""")
+    >>> sel.verify('.item::text', '//li[@class="item"]/text()').getall()
+    ['one', 'two', 'two']
+
+The return value is the result of the CSS query. The two results are compared
+one by one, in document order, by the values that ``.get()`` would extract
+from them, so repeated values and empty values must match as well. Elements,
+attributes and text nodes are compared by their extracted value, which means
+that ``'li'`` and ``'//li/text()'`` are *not* the same query.
+
+If the results differ, :class:`~parsel.selector.VerificationError` is raised,
+and its message names the position where the difference starts and shows both
+values, with the location of the element for element results::
+
+    >>> sel.verify('.item::text', '//li[@class="item"][1]/text()')
+    Traceback (most recent call last):
+        ...
+    parsel.selector.VerificationError: CSS query '.item::text' selects 3 results and XPath query '//li[@class="item"][1]/text()' selects 1 result: the first value matches, and result #2 is selected only by the CSS query ('two')
+
+If either query is invalid, the verification fails as a whole: the other
+query is not used as a fallback. Both queries are run in the scope of the
+selector that ``.verify()`` is called on, and absolute XPath queries on nested
+selectors keep the behavior that they have in ``.xpath()``, including
+:class:`~parsel.selector.AbsoluteXPathWarning`. Additional ``namespaces`` are
+passed to both queries, and additional keyword arguments are passed to the
+XPath query as variables::
+
+    >>> links = Selector(text='<a href="a.html">A</a><a href="b.html">B</a>')
+    >>> links.verify('a[href="b.html"]::attr(href)', '//a[@href=$href]/@href', href='b.html').get()
+    'b.html'
+
+Like ``.css()``, ``.verify()`` is also available on
+:class:`~parsel.selector.SelectorList`, where each selector is checked on its
+own and the CSS results of all of them are returned flattened.
+
 .. _extracting-text:
 
 Extracting text
