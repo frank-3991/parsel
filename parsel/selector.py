@@ -25,10 +25,10 @@ import jmespath
 from lxml import etree, html
 
 from .csstranslator import GenericTranslator, HTMLTranslator
-from .utils import extract_regex, flatten, iflatten, shorten
+from .utils import flatten, iextract_regex, iflatten, shorten
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Iterator, Mapping
     from re import Pattern
 
 
@@ -262,7 +262,11 @@ class SelectorList(list[_SelectorType]):
         Passing ``replace_entities`` as ``False`` switches off these
         replacements.
         """
-        return flatten([x.re(regex, replace_entities=replace_entities) for x in self])
+        return [
+            result
+            for element in self
+            for result in element._ire(regex, replace_entities=replace_entities)
+        ]
 
     @typing.overload
     def re_first(
@@ -300,7 +304,7 @@ class SelectorList(list[_SelectorType]):
         replacements.
         """
         for el in iflatten(
-            x.re(regex, replace_entities=replace_entities) for x in self
+            x._ire(regex, replace_entities=replace_entities) for x in self
         ):
             return typing.cast("str", el)
         return default
@@ -828,6 +832,21 @@ class Selector:
         type_ = _xml_or_html(self.type)
         return _ctgroup[type_]["_csstranslator"].css_to_xpath(query)
 
+    def _ire(
+        self, regex: str | Pattern[str], replace_entities: bool = True
+    ) -> Iterator[str]:
+        """Yield the regex matches of the serialized node, lazily.
+
+        This is the shared implementation behind :meth:`re` and
+        :meth:`re_first`, so single selectors, selector lists and the
+        "first result" variants all follow the same capture-group and
+        character-entity semantics. The node is only serialized when the
+        returned iterator is consumed.
+        """
+        return iextract_regex(
+            regex, typing.cast("str", self.get()), replace_entities=replace_entities
+        )
+
     def re(self, regex: str | Pattern[str], replace_entities: bool = True) -> list[str]:
         """
         Apply the given regex and return a list of strings with the
@@ -841,8 +860,7 @@ class Selector:
         Passing ``replace_entities`` as ``False`` switches off these
         replacements.
         """
-        data = self.get()
-        return extract_regex(regex, data, replace_entities=replace_entities)
+        return list(self._ire(regex, replace_entities=replace_entities))
 
     @typing.overload
     def re_first(
@@ -879,7 +897,7 @@ class Selector:
         replacements.
         """
         return next(
-            iflatten(self.re(regex, replace_entities=replace_entities)),
+            self._ire(regex, replace_entities=replace_entities),
             default,
         )
 

@@ -63,6 +63,61 @@ def _is_listlike(x: Any) -> bool:
     return hasattr(x, "__iter__") and not isinstance(x, (str, bytes))
 
 
+def iextract_regex(
+    regex: str | re.Pattern[str], text: str, replace_entities: bool = True
+) -> Iterator[str]:
+    """Yield the strings extracted from *text* with *regex*, lazily.
+
+    The extraction policies mirror those of :func:`extract_regex`:
+
+    * if the regex contains a named group called "extract", the content of that
+      group is taken from the first match and nothing else is yielded
+    * if the regex contains multiple numbered groups, all those are yielded
+      (flattened) for every match
+    * if the regex doesn't contain any group, the entire regex match is yielded
+
+    Character entity references are replaced by their corresponding character,
+    except for ``&amp;`` and ``&lt;``, unless *replace_entities* is ``False``.
+    Because iteration is lazy, callers that only need the first result never
+    pay for matching the rest of *text*.
+    """
+    if isinstance(regex, str):
+        regex = re.compile(regex, re.UNICODE)
+
+    def process(string: str) -> str:
+        # Character entity references are replaced by their corresponding
+        # character, except for "&amp;" and "&lt;", unless replacements are
+        # switched off.
+        if replace_entities:
+            return w3lib_replace_entities(string, keep=["lt", "amp"])
+        return string
+
+    if "extract" in regex.groupindex:
+        # named group: only the first match is ever considered
+        try:
+            extracted = cast("re.Match[str]", regex.search(text)).group("extract")
+        except AttributeError:
+            return
+        if extracted is not None:
+            yield process(extracted)
+        return
+
+    # full regex or numbered groups. finditer() exposes the same matches as
+    # findall(), but one at a time, and non-participating groups are
+    # normalized to an empty string the way findall() does.
+    group_count = regex.groups
+    if group_count == 0:
+        for match in regex.finditer(text):
+            yield process(match.group(0))
+    elif group_count == 1:
+        for match in regex.finditer(text):
+            yield process(match.group(1) or "")
+    else:
+        for match in regex.finditer(text):
+            for group in match.groups():
+                yield process(group or "")
+
+
 def extract_regex(
     regex: str | re.Pattern[str], text: str, replace_entities: bool = True
 ) -> list[str]:
@@ -71,25 +126,7 @@ def extract_regex(
     * if the regex contains multiple numbered groups, all those will be returned (flattened)
     * if the regex doesn't contain any group the entire regex matching is returned
     """
-    if isinstance(regex, str):
-        regex = re.compile(regex, re.UNICODE)
-
-    if "extract" in regex.groupindex:
-        # named group
-        try:
-            extracted = cast("re.Match[str]", regex.search(text)).group("extract")
-        except AttributeError:
-            strings = []
-        else:
-            strings = [extracted] if extracted is not None else []
-    else:
-        # full regex or numbered groups
-        strings = regex.findall(text)
-
-    strings = flatten(strings)
-    if not replace_entities:
-        return strings
-    return [w3lib_replace_entities(s, keep=["lt", "amp"]) for s in strings]
+    return list(iextract_regex(regex, text, replace_entities))
 
 
 def shorten(text: str, width: int, suffix: str = "...") -> str:

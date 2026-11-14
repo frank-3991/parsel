@@ -671,6 +671,95 @@ class TestSelector:
         x = self.sscls(text=body)
         assert x.xpath("//div").re(r"Evento: (\w+)") == ["cumpleaños"]
 
+    def test_re_first_is_lazy(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """re_first() only serializes nodes up to the first valid result."""
+        body = "".join(f'<li id="{i}">value {i}</li>' for i in range(100))
+        nodes = self.sscls(text=body).xpath("//li")
+
+        calls = 0
+        original_get = type(nodes[0]).get
+
+        def counting_get(self: Selector) -> Any:
+            nonlocal calls
+            calls += 1
+            return original_get(self)
+
+        monkeypatch.setattr(type(nodes[0]), "get", counting_get)
+        result = nodes.re_first(r"value (\d+)")
+
+        assert result == "0"
+        # The first node already matches, so no other node is serialized and
+        # no full match list is built for it either.
+        assert calls == 1
+
+    def test_re_first_skips_nodes_without_a_match(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Nodes without a match are consumed lazily until one matches."""
+        body = (
+            "<ul><li>nothing here</li><li>still nothing</li>"
+            "<li>value 42</li><li>value 43</li></ul>"
+        )
+        nodes = self.sscls(text=body).css("li")
+
+        calls = 0
+        original_get = type(nodes[0]).get
+
+        def counting_get(self: Selector) -> Any:
+            nonlocal calls
+            calls += 1
+            return original_get(self)
+
+        monkeypatch.setattr(type(nodes[0]), "get", counting_get)
+        result = nodes.re_first(r"value (\d+)")
+
+        assert result == "42"
+        # The three first nodes are inspected, the fourth one never is.
+        assert calls == 3
+
+    def test_re_and_re_first_share_semantics(self) -> None:
+        """Single selectors, lists and the first-result variants agree."""
+        body = (
+            "<ul><li>Name: John</li><li>Age: 10</li>"
+            "<li>Name: Paul</li><li>Age: 20</li></ul>"
+        )
+        nodes = self.sscls(text=body).xpath("//li")
+
+        assert nodes.re(r"Name: (\w+)") == ["John", "Paul"]
+        assert nodes.re_first(r"Name: (\w+)") == "John"
+        assert nodes[0].re(r"Name: (\w+)") == ["John"]
+        assert nodes[0].re_first(r"Name: (\w+)") == "John"
+
+        named = r"(?P<extract>Name): (\w+)"
+        assert nodes.re(named) == ["Name", "Name"]
+        assert nodes.re_first(named) == "Name"
+        assert nodes[0].re(named) == nodes.re(named)[:1]
+
+    def test_re_css_xpath_parity(self) -> None:
+        """Chained CSS and XPath extraction return identical regex results."""
+        body = (
+            '<div><a href="/item/1">First &amp; &quot;one&quot;</a>'
+            '<a href="/item/2">Second</a></div>'
+        )
+        selector = self.sscls(text=body)
+
+        assert selector.css("a::text").re(r"(\w+)") == selector.xpath("//a/text()").re(
+            r"(\w+)"
+        )
+        assert (
+            selector.css("a::attr(href)").re(r"/item/(\d+)")
+            == selector.xpath("//a/@href").re(r"/item/(\d+)")
+            == ["1", "2"]
+        )
+        assert selector.css("a::text").re_first(r"(\w+)") == selector.xpath(
+            "//a/text()"
+        ).re_first(r"(\w+)")
+        # Entity handling follows the same path regardless of the query flavor.
+        assert selector.css("a").re(r"^.*$") == selector.xpath("//a").re(r"^.*$")
+        assert selector.css("a").re(r"^.*$", replace_entities=False) == selector.xpath(
+            "//a"
+        ).re(r"^.*$", replace_entities=False)
+
     def test_selector_over_text(self) -> None:
         hs = self.sscls(text="<root>lala</root>")
         assert hs.extract() == "<html><body><root>lala</root></body></html>"
