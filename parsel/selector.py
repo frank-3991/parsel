@@ -23,6 +23,7 @@ from typing import (
 
 import jmespath
 from lxml import etree, html
+from w3lib.encoding import html_body_declared_encoding, to_unicode
 
 from .csstranslator import GenericTranslator, HTMLTranslator
 from .utils import extract_regex, flatten, iflatten, shorten
@@ -96,6 +97,46 @@ def _has_encoding_error(parser: _ParserType) -> bool:
     return any(error.type in _ENCODING_ERROR_TYPES for error in parser.error_log)
 
 
+def _is_html_parser(parser_cls: type[_ParserType]) -> bool:
+    return issubclass(parser_cls, html.HTMLParser)
+
+
+_REPLACEMENT_CHARACTER = "�"
+
+
+def _decode_html_body(body: bytes, encoding: str) -> str:
+    """Decode *body* for the HTML parser, replacing undecodable bytes.
+
+    The requested *encoding* is always tried first, so that an explicit
+    encoding keeps priority over the default and over any declaration in the
+    document. When it cannot decode the whole body, the encoding that the
+    document declares is used instead if it leaves fewer replacement
+    characters, since pages that announce their encoding usually are in it.
+    Whatever neither decodes cleanly becomes ``U+FFFD``.
+
+    ``w3lib`` is used for the declared encoding because its WHATWG decoders
+    turn undefined bytes into ``U+FFFD``, while some Python codecs, such as
+    ``cp932``, map them to private-use characters instead.
+    """
+    try:
+        return body.decode(encoding)
+    except (UnicodeError, LookupError):
+        pass
+    fallback = body.decode(encoding, errors="replace")
+    declared = html_body_declared_encoding(body)
+    if declared is not None:
+        try:
+            declared_text = to_unicode(body, declared)
+        except (UnicodeError, LookupError):
+            pass
+        else:
+            if declared_text.count(_REPLACEMENT_CHARACTER) < fallback.count(
+                _REPLACEMENT_CHARACTER
+            ):
+                return declared_text
+    return fallback
+
+
 def _root_from_decoded_body(
     body: bytes,
     parser_cls: type[_ParserType],
@@ -104,8 +145,12 @@ def _root_from_decoded_body(
     encoding: str,
 ) -> etree._Element:
     """Create a root node from *body*, with undecodable bytes replaced."""
+    if _is_html_parser(parser_cls):
+        text = _decode_html_body(body, encoding)
+    else:
+        text = body.decode(encoding, errors="replace")
     return create_root_node(
-        body.decode(encoding, errors="replace"),
+        text,
         parser_cls,
         base_url=base_url,
         huge_tree=huge_tree,

@@ -1462,6 +1462,98 @@ class TestSelectorBytes(TestSelector):
         selector = Selector(body=body, encoding=encoding, type=type_)
         assert selector.css("b::text").get() == "oh�"
 
+    @pytest.mark.parametrize("encoding", [None, "utf-8", "UTF8"])
+    def test_undecodable_bytes_keep_following_nodes(self, encoding: str | None) -> None:
+        """Nodes after an undecodable byte keep their text and attributes."""
+        body = (
+            b"<html><body><p id='first'>one</p>"
+            b"<p id='bad'>before\x80after</p>"
+            b"<p id='last'>three</p>"
+            b"<a id='link' href='value' data-key='k'>link</a></body></html>"
+        )
+        if encoding is None:
+            selector = Selector(body=body, type="html")
+        else:
+            selector = Selector(body=body, type="html", encoding=encoding)
+        assert selector.css("#first::text").get() == "one"
+        assert selector.css("#bad::text").get() == "before�after"
+        assert selector.css("#last::text").get() == "three"
+        assert selector.css("#link::text").get() == "link"
+        assert selector.css("#link::attr(href)").get() == "value"
+        assert selector.css("#link::attr(data-key)").get() == "k"
+
+    def test_undecodable_bytes_in_attribute_value(self) -> None:
+        """Invalid bytes inside an attribute value do not drop the attribute
+        or the nodes that follow."""
+        body = (
+            b"<html><body><a id='link' href='x\x80y' data-key='k'>link</a>"
+            b"<p id='last'>after</p></body></html>"
+        )
+        selector = Selector(body=body, type="html")
+        assert selector.css("#link::attr(href)").get() == "x�y"
+        assert selector.css("#link::attr(data-key)").get() == "k"
+        assert selector.css("#last::text").get() == "after"
+
+    def test_declared_encoding_conflicting_with_bytes(self) -> None:
+        """A page in its declared encoding decodes correctly, and nodes after
+        an undecodable byte are still collected."""
+        good = "日本語".encode("shift_jis")
+        bad = "日本".encode("shift_jis") + b"\xff" + "語".encode("shift_jis")
+        body = (
+            b"<html><head><meta charset='shift_jis'></head><body><p>"
+            + good
+            + b"</p><p id='bad'>"
+            + bad
+            + b"</p><p id='last'>after</p>"
+            + b"<a id='link' href='value'>link</a></body></html>"
+        )
+        selector = Selector(body=body, type="html")
+        assert selector.css("p:nth-of-type(1)::text").get() == "日本語"
+        assert selector.css("#bad::text").get() == "日本�語"
+        assert selector.css("#last::text").get() == "after"
+        assert selector.css("#link::text").get() == "link"
+        assert selector.css("#link::attr(href)").get() == "value"
+
+    def test_declared_encoding_does_not_override_working_encoding(self) -> None:
+        """The declaration is only a recovery hint: a body that the requested
+        encoding decodes is not re-decoded with the declared one."""
+        body = (
+            "<html><head><meta charset='shift_jis'></head><body>"
+            "<p>café — naïve</p><p id='last'>after</p></body></html>"
+        ).encode()
+        selector = Selector(body=body, type="html")
+        assert selector.css("p:nth-of-type(1)::text").get() == "café — naïve"
+        assert selector.css("#last::text").get() == "after"
+
+    def test_explicit_encoding_keeps_priority_over_declaration(self) -> None:
+        """An explicit encoding that decodes the body wins over a declaration
+        that conflicts with the actual bytes."""
+        body = (
+            b"<html><head><meta charset='utf-8'></head><body>"
+            + "日本語".encode("shift_jis")
+            + b"</body></html>"
+        )
+        selector = Selector(body=body, type="html", encoding="shift_jis")
+        assert selector.css("body::text").get() == "日本語"
+
+    def test_replacement_character_is_stable(self) -> None:
+        """Undecodable bytes always become U+FFFD, never a private-use
+        character, even where the Python codec maps them elsewhere."""
+        body = b"<html><body><p>before\xffafter</p></body></html>"
+        selector = Selector(body=body, type="html", encoding="shift_jis")
+        value = selector.css("p::text").get()
+        assert value == "before�after"
+        assert value is not None
+        assert "\uf8f3" not in value
+
+    def test_encoded_pages_are_unchanged(self) -> None:
+        """A page that the requested encoding fully decodes keeps its results."""
+        text = "<html><body><p class='a'>café</p><p id='last'>after</p></body></html>"
+        for encoding in ("utf-8", "iso-8859-1", "utf-16"):
+            selector = Selector(body=text.encode(encoding), encoding=encoding)
+            assert selector.css(".a::text").get() == "café"
+            assert selector.css("#last::text").get() == "after"
+
     @pytest.mark.parametrize("body", [b"\x00", b"  "])
     def test_blank_body(self, body: bytes) -> None:
         assert Selector(body=body, type="xml").get() == "<html/>"

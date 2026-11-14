@@ -3,6 +3,19 @@
 History
 -------
 
+(unreleased)
+~~~~~~~~~~~~
+
+* Improved ``body`` recovery for HTML input whose bytes the effective encoding
+  cannot decode. Nodes, text and attribute values after an undecodable byte are
+  now always collected instead of being dropped when ``lxml`` does not report
+  the problem, and the encoding declared in the document is used to recover the
+  bytes that the caller's encoding cannot decode, so that a declaration that
+  conflicts with the actual bytes no longer garbles the parts that it would
+  decode correctly. Undecodable bytes are always represented as ``U+FFFD``. An
+  explicit ``encoding`` still takes priority, and the type and error behavior of
+  XML, JSON and text input is unchanged.
+
 1.12.1 (2026-09-28)
 ~~~~~~~~~~~~~~~~~~~
 
